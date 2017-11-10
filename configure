@@ -1,0 +1,918 @@
+#!/usr/bin/tclsh
+set HRKCONFIG_HELP "
+    [file tail [info script]] ...
+
+    This script is a wrapper to cmake/configure.
+
+    --info          : Print variables.
+    --help          : Print this help.
+    --help-config   : Print help about the configuration file hrkconfig.cfg
+    --help-modules  : Print help about how to write modules.
+    --update        : Update files.
+    --list-updates  : List files to update.
+
+    --prefix=PREFIX   : Set another prefix.
+    --host=HOST       : Set another host (Cross compiling).
+
+    --cmake|configure|makefile|defines : Return CMAKE/configure/make arguments.
+    --\[list\]-updates : Update files.
+    --list-templates   : List available templates.
+"
+set HRKCONFIG_CONFIG_HELP "
+
+    The configuration file is `./hrkconfig.cfg`
+
+    CONFIGURE    =./configure : Generate configure script.
+    SCRIPTS      =...         : Generate `./hrkconfig.d/` and scripts inside.
+    NO_COMPILER  =0           : Do not find a compiler.
+    FILES        =...         : Generate from templates. --list-templates
+
+    - avr.tcl            : Enable using arduino IDE.
+    - emacs.tcl          : Generate .dir-locals.el for `company-clang` mode.
+    - wxwidgets.tcl      : Creates WX_LIBS and WX_CXXFLAGS variables. Also WX_FOUND=1|0.
+    - hrkdia             : A tool to process `.dia` diagrams.
+    - c-cpp.tcl          : Generate header files automatically. #ifndef _<filename_uppercase>_    
+
+"
+set HRKCONFIG_CONFIG_HELP_MODULES "
+    ## --update and --list-updates ##
+
+    define-update <name> ...    : Create automated editor.
+      <patterns> : { {\.txt$} ... }
+      <access>   : \"rb|wb\" 
+      <code>     : Modify BUFFER,FILENAME
+
+    hrkconfig-set <var> <val>
+    hrkconfig-append <var> ...
+    hrkconfig-get <var>
+    hrkconfig-get-path <var>  : Returns a list joined with `:`
+    hrkconfig-get-flags <var> : Returns a list joined with ` `
+    hrkconfig-exists <var>    : Is variable set?.
+
+    hrkconfig-add-cmake ...     : Add parameters to cmake call.
+    hrkconfig-add-make ...      : Add code to `config.tmp.mk`.
+    hrkconfig-add-configure ... : Add parameters to ./configure.
+    hrkconfig-add-parsers ...   : Add -D and -I directives to Doxygen/emacs/...
+
+    hrkconfig-define <name> ... : Create a module
+      -flags  CODE : Setup flags for the compiler.
+      -output CODE : Generate files.
+
+    ## TEMPLATES ##
+    @<var>@   : Replaces to variable.
+    @U:<var>@ : Replaces to uppercased variable.
+"
+set HRKCONFIG_TCL [file normalize [info script]]
+set HRKCONFIG_DIR [file dirname $HRKCONFIG_TCL]
+proc hrkconfig { args } {
+    global env HRKCONFIG_TCL HRKCONFIG_HELP HRKCONFIG_DIR \
+	HRKCONFIG_CONFIG_HELP HRKCONFIG_CONFIG_HELP_MODULES
+    set ret [list]
+    if {[llength $args] == 0} {
+	puts stderr "This is hrkconfig, for more help type `--help`"
+    }
+    hrkconfig-loadconfig
+    hrkconfig-source-addons
+    foreach arg $args {
+	if {[string equal $arg --help]} {
+	    return [list $HRKCONFIG_HELP]
+	} elseif {[string equal $arg --help-config]} {
+	    return [list $HRKCONFIG_CONFIG_HELP "Config Path:" {*}[hrkconfig-get HRKCONFIG_PATH]]
+	} elseif {[string equal $arg --help-config]} {
+	    return [list $HRKCONFIG_CONFIG_HELP_MODULES]
+	} elseif {[string equal $arg --list-templates]} {
+	    return [hrkconfig-list-templates-and-format]
+	} elseif {[string equal $arg --update]} {
+	    hrkconfig-update-templates
+	    hrkconfig-update
+	    return {}
+	} elseif {[string equal $arg --list-updates]} {
+	    return [hrkconfig-list-updates]
+	} elseif {[regexp {^([^=][^=]*)=(.*)$} $arg ign var val]} {
+	    set V($var) $val
+	} elseif {[regexp {^--} $arg ign]} {
+	    set F($arg) 1
+	} else {
+	    error "Invalid parameter `$arg`."
+	}
+    }
+    
+    foreach var [array names V] {
+	switch -regexp $var {
+	    ^--build\$     { hrkconfig-set BUILD         $V($var)  }
+	    ^--host\$      { hrkconfig-set HOST          $V($var)  }
+	    ^--prefix\$    { hrkconfig-set PREFIX        $V($var)  }
+	    ^-D            { hrkconfig-add-cmake $var=$V($var)     }
+	    ^--            { hrkconfig-add-configure $var=$V($var) }
+	}
+    }
+    foreach var [array names F] {
+	switch -regexp $var {
+	    ^--configure\$ { }
+	    ^-- { hrkconfig-add-configure $var }
+	}
+    }
+    hrkconfig-calculate-host
+    hrkconfig-calculate-build
+    hrkconfig-calculate-arch-os-api BUILD
+    hrkconfig-calculate-arch-os-api HOST
+    if {[hrkconfig-exists NO_COMPILER]} {
+	hrkconfig-calculate-prefix
+    } else {
+	switch [hrkconfig-get HOST_API] {
+	    gnu     -
+	    mingw32 {
+		hrkconfig-calculate-prefix
+		hrkconfig-calculate-gcc-tools
+		hrkconfig-calculate-search-paths
+	    }
+	    default {
+		hrkconfig-run [hrkconfig-get HOST_API]
+	    }
+	}
+    }
+    hrkconfig-run -search-path
+    if {[hrkconfig-exists NO_COMPILER] == 0} {
+	hrkconfig-calculate-output
+    }
+    foreach flag [array names F] {
+	switch $flag {
+	    --info      { puts stderr [join [hrkconfig-info] "\n"] }
+	    --cmake     { return [hrkconfig-add-cmake]             }
+	    --configure { return [hrkconfig-add-configure]         }
+	    --makefile  { return [hrkconfig-add-make]              }
+	    --defines   { return [hrkconfig-add-parsers]           }
+	}
+    }
+    hrkconfig-update-templates
+    hrkconfig-generate
+    return $ret
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+##
+## VARIABLES.
+##
+proc hrkconfig-set { var val } {
+    global HRKCONFIG HRKCONFIG_VARS
+    if {[info exists HRKCONFIG($var)] == 0} {
+	lappend HRKCONFIG_VARS $var
+    }
+    set HRKCONFIG($var) $val
+}
+proc hrkconfig-append { var args } {
+    global HRKCONFIG HRKCONFIG_VARS
+    if {[info exists HRKCONFIG($var)] == 0} {
+	lappend HRKCONFIG_VARS $var
+    }
+    lappend HRKCONFIG($var) {*}$args
+}
+proc hrkconfig-get { var } {
+    global HRKCONFIG
+    if {[catch {
+	set ret $HRKCONFIG($var)
+    } err]} {
+	error "Please set `$var` variable."
+    }
+    return $ret
+}
+proc hrkconfig-get-path { var } {
+    return [join [hrkconfig-get $var] :]
+}
+proc hrkconfig-get-flags { var } {
+    return [join [hrkconfig-get $var] " "]
+}
+proc hrkconfig-exists { var } {
+    global HRKCONFIG
+    return [info exists HRKCONFIG($var)]
+}
+proc hrkconfig-info { } {
+    global HRKCONFIG HRKCONFIG_VARS
+    set ret [list]
+    foreach var $HRKCONFIG_VARS {
+	lappend ret [format "%-20s = %s" $var $HRKCONFIG($var)]
+    }
+    return $ret
+}
+proc hrkconfig-loadconfig { } {
+    global HRKCONFIG_DIR env
+    hrkconfig-append HRKCONFIG_PATH                                       \
+	[file dirname $HRKCONFIG_DIR]/etc/hrkconfig.cfg                   \
+	[file dirname $HRKCONFIG_DIR]/etc/hrkconfig/[file tail [pwd]].cfg \
+	$env(HOME)/.hrkconfig                                             \
+	hrkconfig.cfg
+    foreach f [hrkconfig-get HRKCONFIG_PATH] {
+	if {[file exists $f]} {
+	    set fp [open $f rb]
+	    set bu [read $fp]
+	    close $fp
+	    foreach line [split $bu "\n"] {
+		if {[regexp {^ *([^= ]*) *= *(.*)$} $line ign vr vl]} {
+		    hrkconfig-set $vr $vl
+		}
+	    }
+	}
+    }
+}
+
+
+
+
+
+
+
+
+
+
+##
+## CALCULATE VARIABLES.
+##
+proc hrkconfig-calculate-build { } {
+    global HRKCONFIG tcl_platform
+    if {[hrkconfig-exists BUILD] == 0} {
+	set O_BUILD_ARCH(intel)  i686
+	set O_BUILD_ARCH(x86_64) x86_64
+	set BUILD_ARCH $O_BUILD_ARCH($tcl_platform(machine))
+	set O_BUILD_OS(Linux)    linux
+	set O_BUILD_API(Linux)   gnu
+	set BUILD_OS   $O_BUILD_OS($tcl_platform(os))
+	set O_BUILD_OS(Windows\ NT)    w64
+	set O_BUILD_API(Windows\ NT)   mingw32
+	set BUILD_API  $O_BUILD_API($tcl_platform(os))
+	hrkconfig-set BUILD $BUILD_ARCH-$BUILD_OS-$BUILD_API
+    }
+    return [hrkconfig-get BUILD]
+}
+proc hrkconfig-calculate-host { } {
+    if {[hrkconfig-exists HOST] == 0} {
+	hrkconfig-set HOST [hrkconfig-calculate-build]
+    }
+}
+proc hrkconfig-calculate-arch-os-api { var } {
+    set sval [split [hrkconfig-get $var] "-"]
+    if {[llength $sval] < 2} {
+	error "`$var` should have 3 components. ARCH-OS-API"
+    }
+    hrkconfig-set ${var}_ARCH [lindex $sval 0]
+    if {[llength $sval] >= 3} {
+	hrkconfig-set ${var}_OS [lindex $sval end-1]
+    } else {
+	hrkconfig-set ${var}_OS none
+    }
+    hrkconfig-set ${var}_API [lindex $sval end]
+    hrkconfig-set ${var} [lindex $sval 0]-[lindex $sval end-1]-[lindex $sval end]
+    hrkconfig-set ${var}_ALL [join $sval -]
+}
+proc hrkconfig-is-same-os { } {
+    set same_os   [string equal [hrkconfig-get BUILD_OS]   [hrkconfig-get HOST_OS]   ]
+    set same_api  [string equal [hrkconfig-get BUILD_API]  [hrkconfig-get HOST_API]  ]
+    return [expr $same_os && $same_api]
+}
+proc hrkconfig-is-same-compiler { } {
+    if {[hrkconfig-is-same-os] == 0} { return 0 }
+    set BUILD_ARCH [hrkconfig-get BUILD_ARCH]
+    set HOST_ARCH  [hrkconfig-get HOST_ARCH]
+    if {[string equal $BUILD_ARCH $HOST_ARCH]} { return 1 }
+    switch $BUILD_ARCH->$HOST_ARCH {
+	x86_64->i686 { return 1 }
+	default      { return 0 }
+    }
+}
+proc hrkconfig-is-native { } {
+    if {[hrkconfig-is-same-os] == 0} { return 0 }
+    set BUILD_ARCH [hrkconfig-get BUILD_ARCH]
+    set HOST_ARCH  [hrkconfig-get HOST_ARCH]
+    if {[string equal $BUILD_ARCH $HOST_ARCH] == 0} { return 0 }
+    return 1
+}
+
+proc hrkconfig-calculate-prefix { {name ""} } {
+    global env
+    if {[hrkconfig-exists BUILD_PREFIX] == 0} {
+	hrkconfig-set BUILD_PREFIX $env(HOME)/.local
+    }
+    if {[hrkconfig-is-native]} {
+	hrkconfig-set HOST_PREFIX_U [hrkconfig-get BUILD_PREFIX]
+	hrkconfig-set HOST_PREFIX_S /usr
+    } else {
+	if {[string length $name] == 0} {
+	    set HOST [hrkconfig-get HOST]
+	} else {
+	    set HOST $name
+	}
+	hrkconfig-set HOST_PREFIX_U [hrkconfig-get BUILD_PREFIX]/$HOST
+	if {[file isdirectory /usr/$HOST/sys-root/mingw]} {
+	    hrkconfig-set HOST_PREFIX_S /usr/$HOST/sys-root/mingw
+	} elseif {[file isdirectory /usr/$HOST]} {
+	    hrkconfig-set HOST_PREFIX_S /usr/$HOST
+	}
+    }
+    if {[hrkconfig-exists PREFIX] == 0} {
+	hrkconfig-set PREFIX [hrkconfig-get HOST_PREFIX_U]
+    }
+    hrkconfig-add-cmake                               \
+	-DCMAKE_INSTALL_PREFIX=[hrkconfig-get PREFIX] \
+	-DCMAKE_STAGING_PREFIX=[hrkconfig-get PREFIX]
+    hrkconfig-add-configure \
+	--prefix=[hrkconfig-get PREFIX]
+    hrkconfig-add-make \
+	PREFIX=[hrkconfig-get PREFIX]
+	
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#########################################################################################
+##
+## GCC TOOLCHAIN.
+##
+proc hrkconfig-calculate-gcc-tools { {name ""} } {
+    if {[hrkconfig-is-same-compiler]} {
+	set TOOL_PREFIX ""
+    } elseif {[string length $name]} {
+	set TOOL_PREFIX $name
+    } else {
+	set TOOL_PREFIX [hrkconfig-get HOST]-
+    }
+    hrkconfig-set TOOL_PREFIX $TOOL_PREFIX
+    foreach nt {
+	{ CC      gcc     } { CXX   g++   } { AR      ar      }
+	{ AS      as      } { LD    ld    } { RANLIB  ranlib  }
+	{ READELF readelf } { STRIP strip } { WINDRES windres }
+    } {
+	hrkconfig-set [lindex $nt 0] $TOOL_PREFIX[lindex $nt 1]
+    }
+    hrkconfig-append CFLAGS
+    hrkconfig-append CXXFLAGS
+    hrkconfig-append LDFLAGS
+    if {[string equal [hrkconfig-get HOST_ARCH] i686]} {
+	hrkconfig-append CFLAGS   -m32
+	hrkconfig-append CXXFLAGS -m32
+    }
+    hrkconfig-append CFLAGS_DEBUG   -g -Wall -DDEBUG
+    
+    hrkconfig-add-cmake \
+	-DCMAKE_C_COMPILER=[hrkconfig-get CC]       \
+	-DCMAKE_CXX_COMPILER=[hrkconfig-get CXX]    \
+	-DCMAKE_C_LINKER=[hrkconfig-get LD]         \
+	-DCMAKE_CXX_LINKER=[hrkconfig-get LD]       \
+	-DCMAKE_RC_COMPILER=[hrkconfig-get WINDRES] \
+	-DCMAKE_RC_FLAGS=-DGCC_WINDRES
+    hrkconfig-add-make             \
+	"CC  =[hrkconfig-get CC]"  \
+	"CXX =[hrkconfig-get CXX]" \
+	"LD  =[hrkconfig-get LD]"  \
+	"AR  =[hrkconfig-get AR]"
+}
+proc hrkconfig-calculate-search-paths { } {
+    if {[hrkconfig-exists HOST_PREFIX_U]} {
+	hrkconfig-append PREFIX_PATH [hrkconfig-get HOST_PREFIX_U]
+    }
+    if {[hrkconfig-exists HOST_PREFIX_S]} {
+	hrkconfig-append PREFIX_PATH [hrkconfig-get HOST_PREFIX_S]
+    }
+    # Add prefix if it does not conflict with a native prefix
+    set native_prefix(/usr)       1
+    set native_prefix(/usr/local) 1
+    set native_prefix([hrkconfig-get BUILD_PREFIX]) 1
+    set prefix [hrkconfig-get PREFIX]
+    if {[hrkconfig-is-native]} {
+	hrkconfig-append PREFIX_PATH $prefix
+    } elseif {[info exists native_prefix($prefix)] == 0} {
+	hrkconfig-append PREFIX_PATH $prefix
+    } else {
+	hrkconfig-append PREFIX_PATH
+    }
+    # Set search paths.
+    set libdirs(1) { lib64 lib }
+    set libdirs(0) { lib }
+    set is64 [string equal [hrkconfig-get HOST_ARCH] x86_64]
+    foreach d [hrkconfig-get PREFIX_PATH] {
+	if {[file isdirectory $d/include]} {
+	    hrkconfig-append INCLUDE_DIRS $d/include
+	}
+	foreach libdir $libdirs($is64) {    
+	    if {[file isdirectory $d/$libdir]} {
+		hrkconfig-append LIBRARY_DIRS $d/$libdir
+	    }
+	}
+    }
+    
+    
+}
+proc hrkconfig-calculate-output { } {
+    
+    switch [hrkconfig-get HOST_OS] {
+	linux {
+	    hrkconfig-add-cmake                        \
+		-DCMAKE_SYSTEM_NAME=Linux              \
+		-DCMAKE_POSITION_INDEPENDENT_CODE=TRUE \
+		-DCMAKE_EXECUTABLE_SUFFIX_C=
+	    hrkconfig-add-make         \
+		"SYSTEM_NAME  =Linux"  \
+		"CFLAGS_LIBS += -fpic" \
+		"EXE          ="
+	}
+	w64 {
+	    hrkconfig-add-cmake                        \
+		-DCMAKE_SYSTEM_NAME=Windows            \
+		-DCMAKE_EXECUTABLE_SUFFIX_C=.exe       \
+		-DCMAKE_EXECUTABLE_SUFFIX_CXX=.exe     \
+		-DCMAKE_SHARED_LIBRARY_LINK_C_FLAGS=   \
+		-DCMAKE_SHARED_LIBRARY_LINK_CXX_FLAGS= \
+		-DCMAKE_RC_FLAGS="-DGCC_WINDRES"
+	    hrkconfig-add-make                     \
+		"SYSTEM_NAME  =Windows" \
+		"EXE          =.exe"
+	}
+	default {
+	    hrkconfig-add-cmake                              \
+		-DCMAKE_SYSTEM_NAME=[hrkconfig-get HOST_API] \
+		-DCMAKE_EXECUTABLE_SUFFIX_C=.elf             \
+		-DCMAKE_SHARED_LIBRARY_LINK_C_FLAGS=         \
+		-DCMAKE_SHARED_LIBRARY_LINK_CXX_FLAGS=
+	    hrkconfig-add-make                     \
+		"SYSTEM_NAME  =[hrkconfig-get HOST_API]" \
+		"EXE          =.elf"
+	}
+    }
+    if {[hrkconfig-is-native] == 0} {
+	hrkconfig-add-cmake                           \
+	    -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+	    -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY  \
+	    -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY  \
+	    -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
+	if {[hrkconfig-exists HOST_PREFIX_S]} {
+	    set d [hrkconfig-get HOST_PREFIX_S]
+	    if {[string equal [file tail $d] mingw]} {
+		set d [file dirname $d]
+	    }
+	    hrkconfig-add-cmake -DCMAKE_SYSROOT=$d
+	}
+	hrkconfig-add-configure \
+	    --host=[hrkconfig-get HOST] --build=[hrkconfig-get BUILD]
+    }
+    hrkconfig-append CFLAGS
+    hrkconfig-append CXXFLAGS
+    hrkconfig-append LDFLAGS
+    hrkconfig-append CFLAGS_DEBUG
+    hrkconfig-append INCLUDE_DIRS
+    hrkconfig-append LIBRARY_DIRS
+    hrkconfig-run -flags
+    
+    
+    set CFLAGS   [hrkconfig-get-flags CFLAGS   ]
+    set CXXFLAGS [hrkconfig-get-flags CXXFLAGS ]
+    set LDFLAGS  [hrkconfig-get-flags LDFLAGS  ]
+    set S_CFLAGS  ""
+    set S_LDFLAGS ""
+    if {[string length $CFLAGS]} {
+	hrkconfig-add-cmake -DCMAKE_C_FLAGS=$CFLAGS
+    }
+    if {[string length $CXXFLAGS]} {
+	hrkconfig-add-cmake -DCMAKE_CXX_FLAGS=$CXXFLAGS
+    }
+    if {[string length $LDFLAGS]} {
+	hrkconfig-add-cmake -DCMAKE_EXE_LINKER_FLAGS=$LDFLAGS
+    }
+    if {[hrkconfig-exists PREFIX_PATH]} {
+	hrkconfig-add-cmake \
+	    -DCMAKE_PREFIX_PATH=[hrkconfig-get-path PREFIX_PATH]
+    }
+    foreach i [hrkconfig-get INCLUDE_DIRS] {
+	set S_CFLAGS "$S_CFLAGS -I$i"
+    }
+    foreach l [hrkconfig-get LIBRARY_DIRS] {
+	set S_LDFLAGS "$S_LDFLAGS -L$l"
+    }
+    hrkconfig-add-configure \
+	CFLAGS=$CFLAGS$S_CFLAGS \
+	LDFLAGS=$LDFLAGS$S_LDFLAGS \
+	CXXFLAGS=$CXXFLAGS$S_CFLAGS
+    foreach var { HOST HOST_OS HOST_ARCH HOST_API HOST_ALL } {
+	hrkconfig-add-make [format "%-20s =%s" $var [hrkconfig-get $var]]
+    }
+    hrkconfig-add-make                                                           \
+	"CFLAGS   += $CFLAGS \$(if DEBUG,[hrkconfig-get-flags CFLAGS_DEBUG])"    \
+	"CXXFLAGS += $CXXFLAGS \$(if DEBUG,[hrkconfig-get-flags CFLAGS_DEBUG])"  \
+	"CFLAGS   += $S_CFLAGS"                                                  \
+	"CXXFLAGS += $S_CFLAGS"                                                  \
+	"LDFLAGS  += $LDFLAGS"                                                   \
+	"LDFLAGS  += $S_LDFLAGS"
+    hrkconfig-add-parsers {*}$CFLAGS {*}$S_CFLAGS 
+    if {[file isdirectory src]} {
+	hrkconfig-add-parsers -I[pwd]/src
+    }
+     
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#########################################################################################
+##
+## ADD TO CODE.
+##
+proc hrkconfig-add-cmake { args } {
+    global CMAKE_FLAGS
+    lappend CMAKE_FLAGS {*}$args
+    return $CMAKE_FLAGS
+}
+proc hrkconfig-add-make  { args } {
+    global MAKE_CODE
+    lappend MAKE_CODE {*}$args
+    return $MAKE_CODE
+}
+proc hrkconfig-add-configure { args } {
+    global CONFIGURE_FLAGS
+    lappend CONFIGURE_FLAGS {*}$args
+    return $CONFIGURE_FLAGS
+}
+proc hrkconfig-add-parsers { args } {
+    global PARSER_FLAGS
+    foreach arg $args {
+	switch -regexp $arg {
+	    {^-D} -
+	    {^-I} { lappend PARSER_FLAGS $arg }
+	}
+    }
+    return $PARSER_FLAGS
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+#########################################################################################
+##
+## GENERATE MAIN OUTPUT.
+##
+proc hrkconfig-generate { } {
+    global HRKCONFIG_TCL HRKCONFIG_DIR
+    hrkconfig-run -output
+    if {[hrkconfig-exists CONFIGURE]} {
+	set oConfigure [file normalize [hrkconfig-get CONFIGURE]]
+	set iConfigure [file normalize $HRKCONFIG_TCL]
+	if {[string equal $oConfigure $iConfigure] == 0} {
+	    puts "Creating $oConfigure ..."
+	    file copy -force $iConfigure $oConfigure
+	    exec chmod +x $oConfigure
+	}
+	if {[string equal [file tail $oConfigure] ./configure]} {
+	    set skip_configure 1
+	}
+	hrkconfig-add-make           \
+	    "all: update" "update:"  \
+	    "\tcd [file dirname $oConfigure] && tclsh [file tail $oConfigure] --update"
+    }
+    if {[file exists CMakeLists.txt]} {
+	set bdir build-[hrkconfig-get HOST]
+	catch { file delete -force build-last }
+	file mkdir $bdir
+	exec ln -s $bdir build-last
+	cd $bdir
+	set cmd [hrkconfig-add-cmake]
+	puts stderr $cmd
+	exec cmake {*}$cmd .. >@ stdout 2>@ stderr <@ stdin
+    } elseif {[file exists ./configure] && [info exists skip_configure]} {
+	set cmd [hrkconfig-add-configure]
+	puts stderr $cmd
+	exec ./configure {*}$cmd >@ stdout 2>@ stderr <@ stdin
+    } elseif {[file exists Makefile]} {
+	puts stderr "Generating config.tmp.mk"
+	set fp [open config.tmp.mk wb]
+	puts $fp "all:"
+	puts $fp [join [hrkconfig-add-make] "\n"]
+	close $fp
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#########################################################################################
+##
+## EXTENDING.
+##
+proc hrkconfig-define { name args } {
+    global HRKCONFIG_DEFINE
+    set HRKCONFIG_DEFINE($name) [dict create -flags {} -output {} -search-path {} {*}$args]
+}
+proc hrkconfig-run { command } {
+    global HRKCONFIG_DEFINE env tcl_platform
+    foreach name [array names HRKCONFIG_DEFINE] {
+	eval [dict get $HRKCONFIG_DEFINE($name) $command]
+    }
+}
+proc hrkconfig-source-addons { } {
+    global HRKCONFIG_DIR HRKCONFIG_TCL HRKCONFIG_FILE env tcl_platform
+    hrkconfig-append SCRIPTS
+    switch $tcl_platform(platform) {
+	windows { set sep ";" }
+	unix    { set sep ":" }
+    }
+    set load_file [list]
+    foreach p [hrkconfig-get SCRIPTS] {
+	# Search it on the local host.
+	foreach d [list                                            \
+		       $HRKCONFIG_DIR                              \
+		       [file dirname $HRKCONFIG_DIR]/lib/hrkconfig \
+		       {*}[split $env(PATH) $sep]                  \
+		      ] {
+	    if {[file exists $d/$p] == 0} continue
+	    lappend load_file     $d/$p
+	    set     save_file($p) $d/$p
+	    break
+	}
+	# Search on the project.
+	if {[info exists save_file($p)] == 0} {
+	    if {[file exists hrkconfig.d/$p] == 0} {
+		error "File `$p` not found."
+	    }
+	    lappend load_file hrkconfig.d/$p
+	}
+    }
+    hrkconfig-add-make "" "PATH =$env(PATH):[pwd]/hrkconfig.d" "export PATH" ""
+    # Save files.
+    foreach p [array names save_file] {
+	if {[file exists hrkconfig.d/$p]} {
+	    if {[file mtime hrkconfig.d/$p] >= [file mtime $save_file($p)]} continue
+	}
+	puts "Creating `hrkconfig.d/$p` ..."
+	file mkdir hrkconfig.d
+	file copy -force $save_file($p) hrkconfig.d/$p
+	catch { exec chmod +x hrkconfig.d/$p }
+    }
+    # Load files.
+    foreach f $load_file {
+	if {[regexp {\.tcl$} $f ign] == 0} continue
+	# puts "Sourcing `$f` ..."
+	source $f
+    }
+}
+
+
+
+
+
+
+
+###########################################################################################
+##
+## AUTOMATED EDITOR.
+##
+proc define-update { name {patterns {\.txt$}} {access ""} {code {}} {help ""} } {
+    global HRKCONFIG_UPDATE
+    set HRKCONFIG_UPDATE($name) [list -p $patterns -a $access -c $code -h $help]
+}
+proc hrkconfig-update-name { NAME filename } {
+    global HRKCONFIG_UPDATE
+    set ret [list]
+    if {[file isdirectory $filename]} {
+	foreach d [glob -nocomplain -directory $filename -type d *] {
+	    lappend ret {*}[hrkconfig-update-name $NAME $d]
+	}
+	foreach f [glob -nocomplain -directory $filename -type f *] {
+	    lappend ret {*}[hrkconfig-update-name $NAME $f]
+	}
+	return $ret
+    }
+    set FILENAME [file normalize $filename]
+    set D $HRKCONFIG_UPDATE($NAME)
+    set ACCESS [dict get $D -a]
+    eval [string map [list %CODE% [dict get $D -c]] {
+	proc edit { FILENAME BUFFER } {
+	    %CODE%
+	    return $BUFFER
+	}
+    }]
+    set MATCH  0
+    foreach pattern [dict get $D -p] {
+	if {[regexp $pattern $FILENAME ign]} {
+	    set MATCH 1
+	    break
+	}
+    }
+    if {$MATCH == 0} { return $ret }
+    set DESC [format "%-20s :%-2s: %s" $NAME $ACCESS $FILENAME]
+    puts stderr $DESC
+    lappend ret $DESC
+    switch $ACCESS {
+	"rb" - "r" {
+	    set FP [open $FILENAME rb]
+	    set BUFFER [read $FP]
+	    close $FP
+	    set BUFFER [edit $FILENAME $BUFFER]
+	}
+	"wb" - "w" {
+	    set FP [open $FILENAME rb]
+	    set BUFFER [read $FP]
+	    close $FP
+	    set BUFFER [edit $FILENAME  $BUFFER]
+	    set FP [open $FILENAME wb]
+	    puts -nonewline $FP $BUFFER
+	    close $FP
+	}
+	default  {
+	    edit $FILENAME ""
+	}
+    }
+    return $ret
+}
+proc hrkconfig-update { { filename . } } {
+    global HRKCONFIG_UPDATE
+    set ret [list]
+    foreach NAME [lsort [array names HRKCONFIG_UPDATE]] {
+	lappend ret {*}[hrkconfig-update-name $NAME $filename]
+    }
+    return $ret
+}
+proc hrkconfig-list-updates { } {
+    global HRKCONFIG_UPDATE
+    set ret [list]
+    foreach u [lsort [array names HRKCONFIG_UPDATE]] {
+	set p [dict get $HRKCONFIG_UPDATE($u) -p]
+	set h [dict get $HRKCONFIG_UPDATE($u) -h]
+	lappend ret [format "%-13s:%-20s: %s" $u $p $h]
+    }
+    return $ret
+}
+proc hrkconfig-replace-arrobas { buffer } {
+    regsub -all "#\\?\[^\n\]*\n" $buffer "" buffer
+    set buffer [string map {@@ <<arroba>>} $buffer]
+    while {[regexp {@([a-zA-Z_][a-zA-Z_]*)@} $buffer ign var]} {
+	if {[regexp {U:(.*)$} $var ign uvar]} {
+	    set val [string map {- _ . _} [string toupper [hrkconfig-get $uvar]]]
+	} else {
+	    set val  [hrkconfig-get $var]
+	}
+	puts "-- Replace @$var@ -> $val"
+	set buffer [string map [list @$var@ $val] $buffer]
+    }
+    set buffer [string map {<<arroba>> @} $buffer]
+    return $buffer
+}
+#######################################################################################
+
+
+
+
+
+
+
+
+########################################################################################
+##
+## TEMPLATES.
+##
+proc hrkconfig-list-templates { } {
+    global HRKCONFIG_TCL HRKCONFIG_TEMPLATES HRKCONFIG_TEMPLATES_ARRAY
+    set ret [list]
+    # Update template database.
+    while {[info exists HRKCONFIG_TEMPLATES] == 0} {
+	set HRKCONFIG_TEMPLATES [list]
+	set dd [file dirname [file dirname $HRKCONFIG_TCL]]/share/templates
+	if {[file isdirectory $dd] == 0} break
+	foreach d [list $dd {*}[glob -nocomplain -directory $dd -type d *]] {
+	    foreach f [glob -nocomplain -directory $d -type f *] {
+		lappend HRKCONFIG_TEMPLATES $f
+		set HRKCONFIG_TEMPLATES_ARRAY([file tail $f]) $f
+	    }
+	}
+	break
+    }
+    return $HRKCONFIG_TEMPLATES
+}
+proc hrkconfig-update-templates { } {
+    hrkconfig-append FILES
+    foreach f [hrkconfig-get FILES] {
+	hrkconfig-create-from-template $f 0
+    }
+}
+proc hrkconfig-create-from-template { f {require 0} } {
+    global HRKCONFIG_TEMPLATES_ARRAY
+    hrkconfig-list-templates
+    set t [file tail $f]
+    regsub {@[a-z0-9]*$} $f {} f
+    if {[info exists HRKCONFIG_TEMPLATES_ARRAY($t)]} {
+	puts stderr "Updating $f ..."
+	# Read input.
+	set fp [open $HRKCONFIG_TEMPLATES_ARRAY($t) rb]
+	fconfigure $fp -translation binary
+	set bu [hrkconfig-replace-arrobas [read $fp]]
+	close $fp
+	# Write.
+	file mkdir [file dirname $f]
+	set fp [open $f wb]
+	puts -nonewline $fp $bu
+	close $fp
+    } elseif {$require} {
+	error "Template `$t` not found."
+    }
+}
+proc hrkconfig-list-templates-and-format { } {
+    set ret [list]
+    foreach f [hrkconfig-list-templates] {
+	set fp [open $f rb]
+	set bu [read $fp]
+	close $fp
+	set s_help [list]
+	set s_name [file tail $f]
+	foreach line [split $bu "\n"] {
+	    if {[regexp "#\\? *(.*)\$" $line ign h] == 0} continue
+	    if {[regexp "name: (.*)\$" $h ign s_name]} {
+		
+	    } else {
+		lappend s_help $h
+	    }
+	}
+	lappend ret [join [list "## $s_name ##" {*}$s_help] "\n    "]
+    }
+    return $ret
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#########################################################################################
+if { [info script] eq $::argv0 } {
+    if {[catch {
+	puts [join [hrkconfig {*}$argv] "\n"]
+    } err]} {
+	puts stderr "hrk-package: $err"
+ 	exit 1
+    }
+}
