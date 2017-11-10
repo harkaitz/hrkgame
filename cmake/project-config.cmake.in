@@ -1,0 +1,25 @@
+# lic:#
+# lic:#    Copyright (C) 2017  Harkaitz Agirre Ezama
+# lic:#
+# lic:#    This file is part of hrk-package.
+# lic:#
+# lic:#    hrk-package is free software: you can redistribute it and/or modify
+# lic:#    it under the terms of the GNU Lesser General Public License as published by
+# lic:#    the Free Software Foundation, either version 3 of the License, or
+# lic:#    (at your option) any later version.
+# lic:#
+# lic:#    hrk-package is distributed in the hope that it will be useful,
+# lic:#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+# lic:#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# lic:#    GNU Lesser General Public License for more details.
+# lic:#
+# lic:#    You should have received a copy of the GNU Lesser General Public License
+# lic:#    along with hrk-package.  If not, see <http://www.gnu.org/licenses/>.
+# lic:#
+#
+# Calculate some variables.
+# PACKAGE_PREFIX_DIR -> PREFIX_DIR
+@PACKAGE_INIT@
+
+set(@PROJECT_NAME@_INCLUDE_DIRS ${PACKAGE_PREFIX_DIR}/include)
+set(@PROJECT_NAME@_LIBRARY      ${PACKAGE_PREFIX_DIR}/lib/libhrkgame.a)
