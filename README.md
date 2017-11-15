@@ -14,8 +14,8 @@ The default prefix is $HOME/.local, you can change it.
 
 ```
 ./configure [--host=i686-w64-mingw32] [--prefix=/usr/local]
-make -C build-last
-make -C build-last install
+make
+make install
 ```
 
 ## Running.

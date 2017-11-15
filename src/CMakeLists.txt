@@ -16,13 +16,20 @@
 # lic:#    You should have received a copy of the GNU Lesser General Public License
 # lic:#    along with hrkgame.  If not, see <http://www.gnu.org/licenses/>.
 # lic:#
+set(HRKGAME_HEADERS
+  hrkgame.hh
+  hrkgame-tictactoe.hh
+  hrkgame-board.hh
+  hrkgame-base.hh
+  hrkaux.h
+  )
 set(HRKGAME_SOURCES
 
-  hrkgame.cc            hrkgame.hh
-  hrkgame-tictactoe.cc  hrkgame-tictactoe.hh
-  hrkgame-board.cc      hrkgame-board.hh
-  hrkgame-base.cc       hrkgame-base.hh
-  hrkaux.c              hrkaux.h
+  hrkgame.cc            
+  hrkgame-tictactoe.cc  
+  hrkgame-board.cc      
+  hrkgame-base.cc       
+  hrkaux.c              
   )
 
 if(${CMAKE_SYSTEM_NAME} STREQUAL Windows)
@@ -32,7 +39,6 @@ add_executable(tictactoe main.cc)
 add_executable(hrkgamex  main.cc)
 add_library(hrkgame  STATIC ${HRKGAME_SOURCES})
 
-
 target_link_libraries(tictactoe hrkgame)
 target_link_libraries(hrkgamex  hrkgame)
 
@@ -40,4 +46,5 @@ target_link_libraries(hrkgamex  hrkgame)
 install(TARGETS hrkgame   DESTINATION lib)
 install(TARGETS tictactoe DESTINATION bin)
 install(TARGETS hrkgamex  DESTINATION bin)
+install(FILES ${HRKGAME_HEADERS} DESTINATION include/hrkgame)
 

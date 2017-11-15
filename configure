@@ -623,6 +623,14 @@ proc hrkconfig-generate { } {
 	set cmd [hrkconfig-add-cmake]
 	puts stderr $cmd
 	exec cmake {*}$cmd .. >@ stdout 2>@ stderr <@ stdin
+	puts stderr "Generating Makefile ..."
+	cd ..
+	set fp [open Makefile wb]
+	foreach t { all install } {
+	    puts $fp "$t:\n\t@cd build-last && \$(MAKE) $t"
+	}
+	puts $fp "clean:\n\trm -rf build-* Makefile"
+	close $fp
     } elseif {[file exists ./configure] && [info exists skip_configure]} {
 	set cmd [hrkconfig-add-configure]
 	puts stderr $cmd
