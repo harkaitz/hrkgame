@@ -3,6 +3,8 @@
 A simple TicTacToe game for the terminal written in C++. It uses the alpha-beta
 algorithm. I wrote this to learn C++ language and CMake.
 
+![Recording](recording.hrkrec.gif)
+
 ### Prerequisites
 
 A C++ compiler and CMake.
